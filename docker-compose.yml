@@ -1,0 +1,48 @@
+services:
+  wiesnmeter:
+    build: .
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - HOSTNAME=https://${DOMAIN:-wiesnmeter.example.com}
+      - DEV_MODE=${DEV_MODE:-false}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - SESSION_SECRET=${SESSION_SECRET:-changeme-in-production-random-secret}
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-wiesnmeter}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318/v1/metrics}
+      - OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER:-both}
+      - OTEL_METRIC_EXPORT_INTERVAL=${OTEL_METRIC_EXPORT_INTERVAL:-5000}
+    labels:
+      - "traefik.enable=true"
+      # Routing rule: match your domain name
+      - "traefik.http.routers.wiesnmeter.rule=Host(`${DOMAIN:-wiesnmeter.example.com}`)"
+      - "traefik.http.routers.wiesnmeter.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.wiesnmeter.tls=true"
+      - "traefik.http.routers.wiesnmeter.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+      # Port on which the container runs
+      - "traefik.http.services.wiesnmeter.loadbalancer.server.port=3000"
+    networks:
+      - traefik-net
+      - internal-net
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    networks:
+      - internal-net
+
+networks:
+  # External network shared with your existing Traefik instance
+  traefik-net:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-net}
+  # Internal network for app-to-collector telemetry traffic
+  internal-net:
+    driver: bridge

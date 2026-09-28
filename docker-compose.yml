@@ -17,14 +17,14 @@ services:
     labels:
       - "traefik.enable=true"
       # Routing rule: match your domain name
-      - "traefik.http.routers.wiesnmeter.rule=Host(`${DOMAIN:-wiesnmeter.example.com}`)"
-      - "traefik.http.routers.wiesnmeter.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.wiesnmeter.rule=Host(`wiesnmeter.tillepille.io`)"
+      - "traefik.http.routers.wiesnmeter.entrypoints=websecure"
       - "traefik.http.routers.wiesnmeter.tls=true"
-      - "traefik.http.routers.wiesnmeter.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.wiesnmeter.tls.certresolver=dnsresolver"
       # Port on which the container runs
       - "traefik.http.services.wiesnmeter.loadbalancer.server.port=3000"
     networks:
-      - traefik-net
+      - traefik
       - internal-net
     depends_on:
       - otel-collector
@@ -40,9 +40,8 @@ services:
 
 networks:
   # External network shared with your existing Traefik instance
-  traefik-net:
+  traefik:
     external: true
-    name: ${TRAEFIK_NETWORK:-traefik-net}
   # Internal network for app-to-collector telemetry traffic
   internal-net:
     driver: bridge

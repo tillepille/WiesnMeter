@@ -6,9 +6,14 @@ import type { Counter } from '@opentelemetry/api';
 
 export interface TelemetryConfig {
   serviceName: string;
-  otlpEndpoint?: string;
+  otlpEndpoint: string;
   exporterType: 'otlp' | 'console' | 'both';
   exportIntervalMillis: number;
+  hasAuth: boolean;
+}
+
+export interface TelemetryInitOptions extends Partial<TelemetryConfig> {
+  headers?: Record<string, string>;
 }
 
 let meterProvider: MeterProvider | null = null;
@@ -17,13 +22,107 @@ let drinksCounter: Counter | null = null;
 // In-memory counter for real-time app UI session stats
 const userDrinkStats = new Map<string, { beer: number; schnaps: number }>();
 
+/**
+ * Normalizes OTLP HTTP metrics endpoint.
+ * Ensures URL does not end with trailing slash and points to /v1/metrics
+ * e.g.:
+ * - https://otlp-gateway-prod-eu-west-0.grafana.net/otlp -> https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics
+ * - https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics -> https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics
+ * - http://localhost:4318 -> http://localhost:4318/v1/metrics
+ */
+export function normalizeOtlpEndpoint(endpoint: string): string {
+  let url = endpoint.trim().replace(/\/+$/, '');
+  if (!url.endsWith('/v1/metrics')) {
+    url = `${url}/v1/metrics`;
+  }
+  return url;
+}
+
+/**
+ * Parses comma-separated key=value header strings (OpenTelemetry standard)
+ * e.g.: "Authorization=Basic abc,X-Custom=123"
+ */
+export function parseHeadersString(headerStr?: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (!headerStr) return headers;
+
+  const parts = headerStr.split(',');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx > 0) {
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim();
+      if (key && val) {
+        headers[key] = val;
+      }
+    }
+  }
+  return headers;
+}
+
+/**
+ * Resolves authentication and custom headers for OTLP export.
+ * Priority order for Authorization header:
+ * 1. Grafana Cloud credentials (GRAFANA_CLOUD_INSTANCE_ID + GRAFANA_CLOUD_API_TOKEN) -> Basic base64(instance:token)
+ * 2. Generic OTLP credentials (OTEL_EXPORTER_OTLP_AUTH_USER + OTEL_EXPORTER_OTLP_AUTH_PASSWORD) -> Basic base64(user:pass)
+ * 3. Direct Authorization header (OTEL_EXPORTER_OTLP_AUTH_HEADER)
+ * 4. OpenTelemetry standard header env vars (OTEL_EXPORTER_OTLP_METRICS_HEADERS, OTEL_EXPORTER_OTLP_HEADERS)
+ */
+export function getTelemetryHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+
+  // 1. Parse standard OpenTelemetry headers environment variables
+  if (process.env.OTEL_EXPORTER_OTLP_HEADERS) {
+    Object.assign(headers, parseHeadersString(process.env.OTEL_EXPORTER_OTLP_HEADERS));
+  }
+  if (process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS) {
+    Object.assign(headers, parseHeadersString(process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS));
+  }
+
+  // 2. Direct Authorization header if specified
+  if (process.env.OTEL_EXPORTER_OTLP_AUTH_HEADER) {
+    headers['Authorization'] = process.env.OTEL_EXPORTER_OTLP_AUTH_HEADER.trim();
+  }
+
+  // 3. Generic OTLP username + password
+  const oTelUser = process.env.OTEL_EXPORTER_OTLP_AUTH_USER || process.env.OTEL_EXPORTER_OTLP_USERNAME;
+  const oTelPass = process.env.OTEL_EXPORTER_OTLP_AUTH_PASSWORD || process.env.OTEL_EXPORTER_OTLP_PASSWORD;
+  if (oTelUser && oTelPass) {
+    const basicAuth = Buffer.from(`${oTelUser.trim()}:${oTelPass.trim()}`).toString('base64');
+    headers['Authorization'] = `Basic ${basicAuth}`;
+  }
+
+  // 4. Grafana Cloud Instance ID + API Token (Access Policy token with metrics:write)
+  const grafanaInstanceId =
+    process.env.GRAFANA_CLOUD_INSTANCE_ID || process.env.GRAFANA_INSTANCE_ID;
+  const grafanaApiToken =
+    process.env.GRAFANA_CLOUD_API_TOKEN ||
+    process.env.GRAFANA_CLOUD_API_KEY ||
+    process.env.GRAFANA_API_KEY ||
+    process.env.GRAFANA_API_TOKEN;
+
+  if (grafanaInstanceId && grafanaApiToken) {
+    const basicAuth = Buffer.from(
+      `${grafanaInstanceId.trim()}:${grafanaApiToken.trim()}`
+    ).toString('base64');
+    headers['Authorization'] = `Basic ${basicAuth}`;
+  }
+
+  return headers;
+}
+
 export function getTelemetryConfig(): TelemetryConfig {
   const serviceName = process.env.OTEL_SERVICE_NAME || 'wiesnmeter';
-  const otlpEndpoint =
+  const rawEndpoint =
     process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ||
+    process.env.GRAFANA_CLOUD_OTLP_ENDPOINT ||
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT ||
-    'http://localhost:4318/v1/metrics';
-  
+    'https://otlp-gateway-prod-eu-west-0.grafana.net/otlp';
+
+  const otlpEndpoint = normalizeOtlpEndpoint(rawEndpoint);
+
   const exporterType = (process.env.OTEL_METRICS_EXPORTER || 'otlp').toLowerCase() as
     | 'otlp'
     | 'console'
@@ -34,16 +133,34 @@ export function getTelemetryConfig(): TelemetryConfig {
     10
   );
 
+  const headers = getTelemetryHeaders();
+  const hasAuth = Boolean(headers['Authorization'] || headers['authorization']);
+
   return {
     serviceName,
     otlpEndpoint,
     exporterType,
     exportIntervalMillis,
+    hasAuth,
   };
 }
 
-export function initTelemetry(configOverride?: Partial<TelemetryConfig>) {
-  const config = { ...getTelemetryConfig(), ...configOverride };
+export function initTelemetry(options?: TelemetryInitOptions) {
+  const baseConfig = getTelemetryConfig();
+  const config: TelemetryConfig = {
+    serviceName: options?.serviceName ?? baseConfig.serviceName,
+    otlpEndpoint: options?.otlpEndpoint ? normalizeOtlpEndpoint(options.otlpEndpoint) : baseConfig.otlpEndpoint,
+    exporterType: options?.exporterType ?? baseConfig.exporterType,
+    exportIntervalMillis: options?.exportIntervalMillis ?? baseConfig.exportIntervalMillis,
+    hasAuth: options?.hasAuth ?? baseConfig.hasAuth,
+  };
+
+  const headers = {
+    ...getTelemetryHeaders(),
+    ...(options?.headers || {}),
+  };
+  const hasAuth = Boolean(headers['Authorization'] || headers['authorization']);
+  config.hasAuth = hasAuth;
 
   const resource = new Resource({
     [ATTR_SERVICE_NAME]: config.serviceName,
@@ -61,9 +178,17 @@ export function initTelemetry(configOverride?: Partial<TelemetryConfig>) {
   }
 
   if (config.exporterType === 'otlp' || config.exporterType === 'both') {
+    if (!hasAuth && config.otlpEndpoint.includes('grafana.net')) {
+      console.warn(
+        '[Telemetry] Warning: Exporting to Grafana Cloud without authentication credentials. Set GRAFANA_CLOUD_INSTANCE_ID and GRAFANA_CLOUD_API_TOKEN in your environment.'
+      );
+    }
+
     const otlpExporter = new OTLPMetricExporter({
       url: config.otlpEndpoint,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
     });
+
     readers.push(
       new PeriodicExportingMetricReader({
         exporter: otlpExporter,
@@ -85,7 +210,7 @@ export function initTelemetry(configOverride?: Partial<TelemetryConfig>) {
   });
 
   console.log(
-    `[Telemetry] Initialized for service "${config.serviceName}" with exporter "${config.exporterType}" (endpoint: ${config.otlpEndpoint})`
+    `[Telemetry] Initialized for service "${config.serviceName}" with exporter "${config.exporterType}" (endpoint: ${config.otlpEndpoint}, auth: ${hasAuth ? 'enabled' : 'none'})`
   );
 
   return { meterProvider, drinksCounter };

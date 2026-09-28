@@ -33,12 +33,12 @@ flowchart LR
     Browser["User Browser (Mobile / Desktop)"]
     Server["WiesnMeter Express Backend"]
     GitHub["GitHub OAuth"]
-    OTel["OpenTelemetry Collector / APM"]
+    Grafana["Grafana Cloud OTLP Gateway (HTTPS)"]
 
     Browser -- "1. Login (/login/github)" --> Server
     Server -- "2. OAuth Token Exchange" --> GitHub
     Browser -- "3. Click: Add Maß / Schnaps" --> Server
-    Server -- "4. Export Counter Metric (username, type)" --> OTel
+    Server -- "4. Export Counter Metric (OTLP/HTTP + Basic Auth)" --> Grafana
 ```
 
 ---
@@ -52,11 +52,50 @@ flowchart LR
 | `GITHUB_CLIENT_ID` | _none_ | GitHub OAuth App Client ID |
 | `GITHUB_CLIENT_SECRET` | _none_ | GitHub OAuth App Client Secret |
 | `SESSION_SECRET` | `wiesnmeter-secret-key-oktoberfest` | Secret key used for signing session cookies |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/metrics` | OpenTelemetry OTLP HTTP receiver endpoint |
 | `OTEL_SERVICE_NAME` | `wiesnmeter` | OpenTelemetry service name resource attribute |
-| `OTEL_METRICS_EXPORTER` | `otlp` | Exporter type: `otlp`, `console`, or `both` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `https://otlp-gateway-prod-eu-west-0.grafana.net/otlp` | Direct Grafana Cloud OTLP endpoint (or `.../otlp/v1/metrics`) |
+| `GRAFANA_CLOUD_INSTANCE_ID` | _none_ | Grafana Cloud Instance ID / Username for Basic Auth |
+| `GRAFANA_CLOUD_API_TOKEN` | _none_ | Grafana Cloud API / Access Policy Token with `metrics:write` scope |
+| `OTEL_EXPORTER_OTLP_HEADERS` | _none_ | Optional standard OpenTelemetry headers (e.g. `Authorization=Basic <base64>`) |
+| `OTEL_METRICS_EXPORTER` | `both` | Exporter type: `otlp`, `console`, or `both` |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `5000` | Metric export interval in milliseconds |
 | `DEV_MODE` | `false` | Enable instant mock login for testing without GitHub keys |
+
+---
+
+## Setting Up Grafana Cloud Direct OTLP Ingestion
+
+WiesnMeter sends OpenTelemetry metrics **directly to Grafana Cloud** over HTTPS using OTLP/HTTP:
+
+1. **Find your Grafana Cloud OTLP Details**:
+   - Log in to your [Grafana Cloud Portal](https://grafana.com).
+   - In your Grafana Cloud stack, locate **OpenTelemetry** and click **Configure** (or **Details**).
+   - Copy your **OTLP Endpoint** (e.g. `https://otlp-gateway-prod-eu-west-0.grafana.net/otlp`).
+   - Copy your **Instance ID** (numeric ID, e.g. `123456`).
+
+2. **Generate an Access Policy Token**:
+   - Create an Access Policy token with the scope: `metrics:write`.
+   - Copy the generated token (starts with `glc_...`).
+
+3. **Configure Environment Variables**:
+   In your `.env` file:
+   ```bash
+   OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-eu-west-0.grafana.net/otlp
+   GRAFANA_CLOUD_INSTANCE_ID=123456
+   GRAFANA_CLOUD_API_TOKEN=glc_your_token_here
+   ```
+   *(Alternatively, you can supply `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(instance_id:token)>"` directly).*
+
+4. **Verify Metrics in Grafana Cloud**:
+   - Open Grafana Cloud -> **Explore** -> Select the **Prometheus** / Mimir data source.
+   - Run PromQL queries:
+     ```promql
+     # Overall drink rate:
+     sum by (type) (rate(drinks_total[5m]))
+
+     # Leaderboard of top drinkers:
+     topk(10, sum by (username) (drinks_total))
+     ```
 
 ---
 
@@ -72,6 +111,7 @@ Copy the sample environment file:
 ```bash
 cp .env.example .env
 ```
+Fill in your `GRAFANA_CLOUD_INSTANCE_ID`, `GRAFANA_CLOUD_API_TOKEN`, and `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
 ### 3. Run in Development Mode
 ```bash
@@ -107,36 +147,30 @@ View the logs as drinks are recorded:
 docker logs -f wiesnmeter
 ```
 
-### Run with OpenTelemetry Collector via Docker Compose
-A `docker-compose.yml` and `otel-collector-config.yaml` are included to test end-to-end telemetry ingestion locally:
-
-```bash
-docker compose up --build
-```
-This starts:
-1. **WiesnMeter** at [http://localhost:3000](http://localhost:3000)
-2. **OpenTelemetry Collector** listening on port `4318` (HTTP) and `4317` (gRPC), printing all incoming metrics to stdout.
-
 ### Deploying Behind Traefik Reverse Proxy
 
-The [`docker-compose.yml`](docker-compose.yml) is pre-configured with Traefik routing labels and network configuration.
+The [`docker-compose.yml`](docker-compose.yml) is pre-configured with Traefik routing labels and direct Grafana Cloud metric forwarding:
 
 1. **Ensure the external Traefik network exists**:
    ```bash
-   docker network create traefik-net # or use your existing Traefik network
+   docker network create traefik # or your existing Traefik network
    ```
 
 2. **Configure your `.env`**:
    ```bash
-   DOMAIN=wiesn.yourdomain.com
-   TRAEFIK_NETWORK=traefik-net
-   TRAEFIK_ENTRYPOINT=websecure
-   TRAEFIK_CERT_RESOLVER=letsencrypt
-   HOSTNAME=https://wiesn.yourdomain.com
-   GITHUB_CLIENT_ID=your_id
-   GITHUB_CLIENT_SECRET=your_secret
+   DOMAIN=wiesnmeter.tillepille.io
+   PORT=3000
    SESSION_SECRET=$(openssl rand -hex 32)
    COOKIE_SECURE=true
+
+   # GitHub OAuth
+   GITHUB_CLIENT_ID=your_id
+   GITHUB_CLIENT_SECRET=your_secret
+
+   # Grafana Cloud OTLP Direct
+   OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-eu-west-0.grafana.net/otlp
+   GRAFANA_CLOUD_INSTANCE_ID=123456
+   GRAFANA_CLOUD_API_TOKEN=glc_your_token_here
    ```
 
 3. **Start the stack**:

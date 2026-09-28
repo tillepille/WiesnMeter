@@ -11,9 +11,12 @@ services:
       - SESSION_SECRET=${SESSION_SECRET:-changeme-in-production-random-secret}
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
       - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-wiesnmeter}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318/v1/metrics}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-https://otlp-gateway-prod-eu-west-0.grafana.net/otlp}
       - OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER:-both}
       - OTEL_METRIC_EXPORT_INTERVAL=${OTEL_METRIC_EXPORT_INTERVAL:-5000}
+      - GRAFANA_CLOUD_INSTANCE_ID=${GRAFANA_CLOUD_INSTANCE_ID:-}
+      - GRAFANA_CLOUD_API_TOKEN=${GRAFANA_CLOUD_API_TOKEN:-}
+      - OTEL_EXPORTER_OTLP_HEADERS=${OTEL_EXPORTER_OTLP_HEADERS:-}
     labels:
       - "traefik.enable=true"
       # Routing rule: match your domain name
@@ -25,23 +28,8 @@ services:
       - "traefik.http.services.wiesnmeter.loadbalancer.server.port=3000"
     networks:
       - traefik
-      - internal-net
-    depends_on:
-      - otel-collector
-
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
-    restart: unless-stopped
-    command: ["--config=/etc/otelcol-contrib/config.yaml"]
-    volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
-    networks:
-      - internal-net
 
 networks:
   # External network shared with your existing Traefik instance
   traefik:
     external: true
-  # Internal network for app-to-collector telemetry traffic
-  internal-net:
-    driver: bridge

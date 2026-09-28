@@ -9,7 +9,14 @@ process.env.OTEL_METRICS_EXPORTER = 'console';
 process.env.OTEL_METRIC_EXPORT_INTERVAL = '60000';
 
 import { app } from '../server.js';
-import { shutdownTelemetry } from '../telemetry.js';
+import {
+  shutdownTelemetry,
+  normalizeOtlpEndpoint,
+  parseHeadersString,
+  getTelemetryHeaders,
+  getTelemetryConfig,
+  initTelemetry,
+} from '../telemetry.js';
 
 describe('WiesnMeter API & Telemetry Tests', () => {
   let server: Server;
@@ -138,5 +145,120 @@ describe('WiesnMeter API & Telemetry Tests', () => {
       headers: { Cookie: cookieHeader },
     });
     assert.equal(logoutRes.status, 200);
+  });
+
+  test('normalizeOtlpEndpoint ensures /v1/metrics suffix', () => {
+    assert.equal(
+      normalizeOtlpEndpoint('https://otlp-gateway-prod-eu-west-0.grafana.net/otlp'),
+      'https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics'
+    );
+    assert.equal(
+      normalizeOtlpEndpoint('https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/'),
+      'https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics'
+    );
+    assert.equal(
+      normalizeOtlpEndpoint('https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics'),
+      'https://otlp-gateway-prod-eu-west-0.grafana.net/otlp/v1/metrics'
+    );
+    assert.equal(
+      normalizeOtlpEndpoint('http://localhost:4318'),
+      'http://localhost:4318/v1/metrics'
+    );
+  });
+
+  test('parseHeadersString parses comma-separated headers', () => {
+    const headers = parseHeadersString('Authorization=Basic abc123def, X-Custom=foo ,Empty=');
+    assert.equal(headers['Authorization'], 'Basic abc123def');
+    assert.equal(headers['X-Custom'], 'foo');
+    assert.equal(headers['Empty'], undefined);
+  });
+
+  test('getTelemetryHeaders generates Basic auth from Grafana Cloud credentials', () => {
+    const savedInstanceId = process.env.GRAFANA_CLOUD_INSTANCE_ID;
+    const savedApiToken = process.env.GRAFANA_CLOUD_API_TOKEN;
+
+    try {
+      process.env.GRAFANA_CLOUD_INSTANCE_ID = '987654';
+      process.env.GRAFANA_CLOUD_API_TOKEN = 'glc_mysecrettoken';
+
+      const headers = getTelemetryHeaders();
+      const expectedEncoded = Buffer.from('987654:glc_mysecrettoken').toString('base64');
+      assert.equal(headers['Authorization'], `Basic ${expectedEncoded}`);
+
+      const config = getTelemetryConfig();
+      assert.equal(config.hasAuth, true);
+    } finally {
+      if (savedInstanceId !== undefined) {
+        process.env.GRAFANA_CLOUD_INSTANCE_ID = savedInstanceId;
+      } else {
+        delete process.env.GRAFANA_CLOUD_INSTANCE_ID;
+      }
+      if (savedApiToken !== undefined) {
+        process.env.GRAFANA_CLOUD_API_TOKEN = savedApiToken;
+      } else {
+        delete process.env.GRAFANA_CLOUD_API_TOKEN;
+      }
+    }
+  });
+
+  test('getTelemetryHeaders parses standard OTEL_EXPORTER_OTLP_HEADERS', () => {
+    const savedHeaders = process.env.OTEL_EXPORTER_OTLP_HEADERS;
+
+    try {
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = 'Authorization=Basic customencoded,X-Tenant=wiesn';
+
+      const headers = getTelemetryHeaders();
+      assert.equal(headers['Authorization'], 'Basic customencoded');
+      assert.equal(headers['X-Tenant'], 'wiesn');
+    } finally {
+      if (savedHeaders !== undefined) {
+        process.env.OTEL_EXPORTER_OTLP_HEADERS = savedHeaders;
+      } else {
+        delete process.env.OTEL_EXPORTER_OTLP_HEADERS;
+      }
+    }
+  });
+
+  test('Direct OTLP exporter sends Authorization header to mock HTTP server', async () => {
+    const receivedHeaders: Record<string, string | string[] | undefined>[] = [];
+    let mockServer: Server;
+    let mockUrl: string;
+
+    await new Promise<void>((resolve) => {
+      mockServer = require('http').createServer((req: any, res: any) => {
+        receivedHeaders.push(req.headers);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      mockServer.listen(0, () => {
+        const addr = mockServer.address() as any;
+        mockUrl = `http://localhost:${addr.port}/otlp/v1/metrics`;
+        resolve();
+      });
+    });
+
+    const expectedAuth = 'Basic ' + Buffer.from('112233:secret_token').toString('base64');
+
+    const { meterProvider } = initTelemetry({
+      exporterType: 'otlp',
+      otlpEndpoint: mockUrl!,
+      exportIntervalMillis: 100,
+      headers: {
+        Authorization: expectedAuth,
+      },
+    });
+
+    const meter = meterProvider.getMeter('test-auth-meter');
+    const testCounter = meter.createCounter('drinks_total');
+    testCounter.add(1, { username: 'testuser', type: 'beer' });
+
+    await meterProvider.forceFlush();
+    await shutdownTelemetry();
+
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+
+    assert.ok(receivedHeaders.length > 0, 'Should have received export request');
+    const firstReq = receivedHeaders[0];
+    assert.equal(firstReq['authorization'], expectedAuth);
   });
 });

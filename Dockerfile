@@ -21,7 +21,7 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME=http://localhost:3000
 ENV OTEL_SERVICE_NAME=wiesnmeter
-ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/metrics
+ENV OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-eu-west-0.grafana.net/otlp
 ENV OTEL_METRICS_EXPORTER=otlp
 ENV OTEL_METRIC_EXPORT_INTERVAL=5000
 
